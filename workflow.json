@@ -1,0 +1,281 @@
+{
+  "name": "Stripe Payout to Bank Reconciliation — aggregated deposit splitting",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "bb86b47c-29de-4e9e-94e4-8813385b18c9",
+      "name": "Upload CSVs",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [-460, 0],
+      "parameters": {
+        "formTitle": "Payout Reconciliation",
+        "formDescription": "Upload the platform export (Stripe/PayPal transactions) and the bank statement. You get back a sheet with three tabs: Reconciled, Pending, Differences.",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "Platform CSV", "fieldType": "file", "multipleFiles": false, "acceptFileTypes": ".csv", "requiredField": true },
+            { "fieldLabel": "Bank CSV", "fieldType": "file", "multipleFiles": false, "acceptFileTypes": ".csv", "requiredField": true }
+          ]
+        },
+        "responseMode": "onReceived"
+      }
+    },
+    {
+      "id": "f509429b-f8ab-438c-bc5a-4b5563a2caf0",
+      "name": "Extract Platform Rows",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [-220, -120],
+      "parameters": {
+        "operation": "csv",
+        "binaryPropertyName": "Platform_CSV",
+        "options": { "headerRow": true }
+      }
+    },
+    {
+      "id": "2087cc1e-6b6d-430d-93d4-8c43f4d6c698",
+      "name": "Extract Bank Rows",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [-220, 120],
+      "parameters": {
+        "operation": "csv",
+        "binaryPropertyName": "Bank_CSV",
+        "options": { "headerRow": true }
+      }
+    },
+    {
+      "id": "963dca3f-e4e0-45ac-b6a0-fcee1a616553",
+      "name": "Wait For Both Files",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [0, 0],
+      "parameters": { "mode": "append" }
+    },
+    {
+      "id": "418a39a7-4671-457d-9b3a-9d7ff71fc241",
+      "name": "Reconcile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const CONFIG = { centTolerance: 0.05, dateWindowDays: 3 };\nfunction round2(n) { return Math.round(n * 100) / 100; }\nfunction daysBetween(a, b) { return Math.abs((new Date(a).getTime() - new Date(b).getTime()) / 86400000); }\n\n// --- normalize both sources to one schema, dedupe by id (idempotency) ---\nconst platformRaw = $('Extract Platform Rows').all().map(function (i) { return i.json; });\nconst bankRaw = $('Extract Bank Rows').all().map(function (i) { return i.json; });\n\nconst seenIds = new Set();\nconst platform = [];\nfor (const r of platformRaw) {\n  const id = String(r.id || '').trim();\n  if (!id || seenIds.has(id)) continue; // reprocessing the same file duplicates nothing\n  seenIds.add(id);\n  platform.push({ id: id, date: String(r.date || ''), type: String(r.type || '').toLowerCase(), amount: Number(r.amount) || 0, fee: Number(r.fee) || 0, ref: String(r.ref || '') });\n}\nconst seenBank = new Set();\nconst bank = [];\nfor (const r of bankRaw) {\n  const key = String(r.date) + '|' + String(r.amount) + '|' + String(r.description);\n  if (seenBank.has(key)) continue;\n  seenBank.add(key);\n  bank.push({ date: String(r.date || ''), amount: Number(r.amount) || 0, description: String(r.description || '') });\n}\n\n// refunds stay as their own signed lines; payouts are the aggregation records\nconst txns = platform.filter(function (t) { return t.type !== 'payout'; });\nconst payouts = platform.filter(function (t) { return t.type === 'payout'; });\n\n// settlement batches: the set of transactions that compose one deposit\nconst batches = {};\nfor (const t of txns) { if (!batches[t.date]) batches[t.date] = []; batches[t.date].push(t); }\nfunction batchNet(d) { return round2(batches[d].reduce(function (s, t) { return s + t.amount - t.fee; }, 0)); }\n\nconst rows = [];\nfunction push(tab, fields) { rows.push({ json: Object.assign({ tab: tab }, fields) }); }\n\nconst usedBatches = new Set();\nconst matchedPayoutRefs = new Set();\n\nfor (const dep of bank) {\n  // tier 1: exact reference\n  let payout = payouts.find(function (p) { return p.ref && dep.description.indexOf(p.ref) !== -1; });\n  let criterion = payout ? 'exact_reference' : null;\n  // tier 2: amount match inside the date window\n  if (!payout) {\n    payout = payouts.find(function (p) { return !matchedPayoutRefs.has(p.ref) && Math.abs(p.amount - dep.amount) < 0.005 && daysBetween(p.date, dep.date) <= CONFIG.dateWindowDays; });\n    if (payout) criterion = 'amount_in_date_window';\n  }\n  // tier 3: amount within the configured cent tolerance\n  if (!payout) {\n    payout = payouts.find(function (p) { return !matchedPayoutRefs.has(p.ref) && Math.abs(p.amount - dep.amount) <= CONFIG.centTolerance; });\n    if (payout) criterion = 'amount_cent_tolerance';\n  }\n  if (!payout) {\n    push('Differences', { date: dep.date, kind: 'bank_deposit', reference: dep.description, amount: dep.amount, reason: 'no_platform_counterpart', criterion: '', delta: '', detail: 'no platform payout matches this deposit' });\n    continue;\n  }\n  matchedPayoutRefs.add(payout.ref);\n\n  // --- disaggregation: open the deposit against the batch that composes it ---\n  let best = null;\n  let bestDelta = Infinity;\n  for (const d of Object.keys(batches)) {\n    if (usedBatches.has(d)) continue;\n    const delta = Math.abs(batchNet(d) - dep.amount);\n    if (delta < bestDelta) { bestDelta = delta; best = d; }\n  }\n  if (best === null) {\n    push('Differences', { date: dep.date, kind: 'bank_deposit', reference: dep.description, amount: dep.amount, reason: 'no_platform_counterpart', criterion: criterion, delta: '', detail: 'no settlement batch left to compose this deposit' });\n    continue;\n  }\n  usedBatches.add(best);\n  const comp = batches[best];\n  const net = batchNet(best);\n  const withinAmount = bestDelta <= CONFIG.centTolerance;\n  const lagDays = round2(daysBetween(best, dep.date));\n  const withinWindow = lagDays <= CONFIG.dateWindowDays;\n\n  if (withinAmount && withinWindow) {\n    push('Reconciled', { date: dep.date, kind: 'bank_deposit', reference: dep.description, amount: dep.amount, matched_to: 'batch ' + best + ' (' + comp.length + ' transactions)', criterion: criterion, delta: round2(bestDelta) });\n    for (const t of comp) {\n      push('Reconciled', { date: t.date, kind: t.type, reference: t.id, amount: round2(t.amount - t.fee), matched_to: dep.description, criterion: criterion, delta: 0 });\n    }\n  } else {\n    const reasons = [];\n    if (!withinAmount) reasons.push('amount_difference');\n    if (!withinWindow) reasons.push('outside_window');\n    push('Differences', { date: dep.date, kind: 'bank_deposit', reference: dep.description, amount: dep.amount, reason: reasons.join('+'), criterion: criterion, delta: round2(net - dep.amount), detail: 'batch ' + best + ' nets ' + net + ', deposit is ' + dep.amount + ', lag ' + lagDays + ' days' });\n    for (const t of comp) {\n      push('Pending', { date: t.date, kind: t.type, reference: t.id, amount: round2(t.amount - t.fee), matched_to: dep.description, reason: 'deposit flagged: ' + reasons.join('+') });\n    }\n  }\n}\n\n// platform payouts that never landed in the bank\nfor (const p of payouts) {\n  if (!matchedPayoutRefs.has(p.ref)) {\n    push('Differences', { date: p.date, kind: 'platform_payout', reference: p.ref, amount: p.amount, reason: 'no_bank_counterpart', criterion: '', delta: '', detail: 'payout never appeared in the bank statement' });\n  }\n}\n// settlement batches never tied to any deposit\nfor (const d of Object.keys(batches)) {\n  if (usedBatches.has(d)) continue;\n  for (const t of batches[d]) {\n    push('Pending', { date: t.date, kind: t.type, reference: t.id, amount: round2(t.amount - t.fee), matched_to: '', reason: 'no deposit composed from this settlement batch' });\n  }\n}\nreturn rows;"
+      }
+    },
+    {
+      "id": "0729c2aa-dc83-445f-b4b9-feaa607a0fe7",
+      "name": "Route By Tab",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [460, -60],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "renameOutput": true,
+              "outputKey": "Reconciled",
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [{ "leftValue": "={{ $json.tab }}", "operator": { "type": "string", "operation": "equals" }, "rightValue": "Reconciled" }],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "Pending",
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [{ "leftValue": "={{ $json.tab }}", "operator": { "type": "string", "operation": "equals" }, "rightValue": "Pending" }],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "Differences",
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [{ "leftValue": "={{ $json.tab }}", "operator": { "type": "string", "operation": "equals" }, "rightValue": "Differences" }],
+                "combinator": "and"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "24bddfc9-d0b2-48bf-b505-c671a6470907",
+      "name": "Append Reconciled",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [720, -220],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Reconciliation (tabs: Reconciled, Pending, Differences)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Reconciled" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "date": "={{ $json.date }}",
+            "kind": "={{ $json.kind }}",
+            "reference": "={{ $json.reference }}",
+            "amount": "={{ $json.amount }}",
+            "matched_to": "={{ $json.matched_to }}",
+            "criterion": "={{ $json.criterion }}",
+            "delta": "={{ $json.delta }}"
+          },
+          "schema": [
+            { "id": "date", "displayName": "date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "kind", "displayName": "kind", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reference", "displayName": "reference", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "amount", "displayName": "amount", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "matched_to", "displayName": "matched_to", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "criterion", "displayName": "criterion", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "delta", "displayName": "delta", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false }
+          ]
+        }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "02592f9f-7412-41b2-9a0c-d12ffd1bb28d",
+      "name": "Append Pending",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [720, 0],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Reconciliation (tabs: Reconciled, Pending, Differences)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Pending" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "date": "={{ $json.date }}",
+            "kind": "={{ $json.kind }}",
+            "reference": "={{ $json.reference }}",
+            "amount": "={{ $json.amount }}",
+            "matched_to": "={{ $json.matched_to }}",
+            "reason": "={{ $json.reason }}"
+          },
+          "schema": [
+            { "id": "date", "displayName": "date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "kind", "displayName": "kind", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reference", "displayName": "reference", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "amount", "displayName": "amount", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "matched_to", "displayName": "matched_to", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reason", "displayName": "reason", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false }
+          ]
+        }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "0f30f976-f8ed-427b-a7ab-d294158e0281",
+      "name": "Append Differences",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [720, 220],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "list", "value": "", "cachedResultName": "Reconciliation (tabs: Reconciled, Pending, Differences)" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Differences" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "date": "={{ $json.date }}",
+            "kind": "={{ $json.kind }}",
+            "reference": "={{ $json.reference }}",
+            "amount": "={{ $json.amount }}",
+            "reason": "={{ $json.reason }}",
+            "criterion": "={{ $json.criterion }}",
+            "delta": "={{ $json.delta }}",
+            "detail": "={{ $json.detail }}"
+          },
+          "schema": [
+            { "id": "date", "displayName": "date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "kind", "displayName": "kind", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reference", "displayName": "reference", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "amount", "displayName": "amount", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "reason", "displayName": "reason", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "criterion", "displayName": "criterion", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "delta", "displayName": "delta", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false },
+            { "id": "detail", "displayName": "detail", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": false }
+          ]
+        }
+      },
+      "credentials": { "googleSheetsOAuth2Api": { "name": "Google Sheets account" } }
+    },
+    {
+      "id": "69ac5556-1e8d-4b03-bf4d-d839a5be4dfd",
+      "name": "Build Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 200],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const rows = $input.all().map(function (i) { return i.json; });\nconst deposits = rows.filter(function (r) { return r.kind === 'bank_deposit'; });\nconst reconciled = deposits.filter(function (r) { return r.tab === 'Reconciled'; });\nconst differences = rows.filter(function (r) { return r.tab === 'Differences'; });\nconst pending = rows.filter(function (r) { return r.tab === 'Pending'; });\nfunction sum(list) { return Math.round(list.reduce(function (s, r) { return s + (Number(r.amount) || 0); }, 0) * 100) / 100; }\nlet largest = null;\nfor (const d of differences) {\n  const delta = Math.abs(Number(d.delta) || 0);\n  if (!largest || delta > Math.abs(Number(largest.delta) || 0)) largest = d;\n}\nconst lines = [\n  'Payout reconciliation finished.',\n  '',\n  'Reconciled deposits: ' + reconciled.length + ' (total ' + sum(reconciled) + ')',\n  'Flagged in Differences: ' + differences.length,\n  'Transactions left Pending: ' + pending.length + ' (total ' + sum(pending) + ')',\n  ''\n];\nif (largest) {\n  lines.push('Largest difference: ' + largest.reference + ' — ' + largest.reason + (largest.delta !== '' ? ' (delta ' + largest.delta + ')' : ''));\n}\nreturn [{ json: { subject: 'Reconciliation: ' + reconciled.length + ' deposits ok, ' + differences.length + ' flagged', body: lines.join('\\n') } }];"
+      }
+    },
+    {
+      "id": "e79da7f8-81d4-4e20-8f8b-4ec76f1df889",
+      "name": "Email Summary",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [720, 440],
+      "executeOnce": true,
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "you@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": { "appendAttribution": false }
+      },
+      "credentials": { "gmailOAuth2": { "name": "Gmail account" } }
+    },
+    {
+      "id": "ee2e2b65-72ad-405f-9b5e-579795a537ee",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [170, -50],
+      "parameters": {
+        "content": "## The node that matters: deposit disaggregation\n\nStripe/PayPal deposit a net that bundles N transactions minus fees and refunds. Reconcile opens each bank deposit against the settlement batch that composes it, matching in three tiers (exact reference, amount in +-3d window, cent tolerance). Tolerances are CONFIG at the top of the code — nothing is reconciled by approximation without recording the criterion used.",
+        "color": 5,
+        "width": 300,
+        "height": 200
+      }
+    }
+  ],
+  "connections": {
+    "Upload CSVs": { "main": [[
+      { "node": "Extract Platform Rows", "type": "main", "index": 0 },
+      { "node": "Extract Bank Rows", "type": "main", "index": 0 }
+    ]] },
+    "Extract Platform Rows": { "main": [[{ "node": "Wait For Both Files", "type": "main", "index": 0 }]] },
+    "Extract Bank Rows": { "main": [[{ "node": "Wait For Both Files", "type": "main", "index": 1 }]] },
+    "Wait For Both Files": { "main": [[{ "node": "Reconcile", "type": "main", "index": 0 }]] },
+    "Reconcile": { "main": [[
+      { "node": "Route By Tab", "type": "main", "index": 0 },
+      { "node": "Build Summary", "type": "main", "index": 0 }
+    ]] },
+    "Route By Tab": { "main": [
+      [{ "node": "Append Reconciled", "type": "main", "index": 0 }],
+      [{ "node": "Append Pending", "type": "main", "index": 0 }],
+      [{ "node": "Append Differences", "type": "main", "index": 0 }]
+    ] },
+    "Build Summary": { "main": [[{ "node": "Email Summary", "type": "main", "index": 0 }]] }
+  }
+}
